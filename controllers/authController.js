@@ -41,14 +41,14 @@ export const signup = async (req, res, next) => {
       tokenExpiry: expiry,
     });
 
-    // Send verification email (non-blocking)
+    // Send verification email
     const emailSent = await sendVerificationEmail(email, name, token);
 
     res.status(201).json({
       success: true,
       message: emailSent 
         ? 'Verification email sent. Please check your inbox to verify your email.'
-        : 'Account created successfully. Email verification is temporarily unavailable, but you can still use your account.',
+        : 'Account created. Email service unavailable - contact admin for verification.',
       data: {
         email: pendingUser.email,
         tokenExpiry: pendingUser.tokenExpiry,
