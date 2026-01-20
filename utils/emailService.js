@@ -10,6 +10,9 @@ const createTransporter = () => {
       user: process.env.EMAIL_USER,
       pass: process.env.EMAIL_PASSWORD, // Use App Password, not regular password
     },
+    // Add timeout settings to fail faster
+    connectionTimeout: 5000,
+    greetingTimeout: 5000,
   });
 };
 
@@ -98,10 +101,13 @@ export const sendVerificationEmail = async (email, name, verificationToken) => {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Verification email sent to ${email}`);
+    console.log(`✓ Verification email sent to ${email}`);
+    return true;
   } catch (error) {
-    console.error('Error sending verification email:', error);
-    throw new Error('Failed to send verification email');
+    console.error('✗ Failed to send verification email:', error.message);
+    console.log('Note: User signup will continue without email verification');
+    // Don't throw error - allow signup to continue
+    return false;
   }
 };
 
@@ -179,10 +185,13 @@ export const sendPasswordResetEmail = async (email, name, resetToken) => {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Password reset email sent to ${email}`);
+    console.log(`✓ Password reset email sent to ${email}`);
+    return true;
   } catch (error) {
-    console.error('Error sending password reset email:', error);
-    throw new Error('Failed to send password reset email');
+    console.error('✗ Failed to send password reset email:', error.message);
+    console.log('Note: Password reset will continue without email');
+    // Don't throw error - allow reset to continue
+    return false;
   }
 };
 
@@ -248,9 +257,11 @@ export const sendWelcomeEmail = async (email, name) => {
 
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Welcome email sent to ${email}`);
+    console.log(`✓ Welcome email sent to ${email}`);
+    return true;
   } catch (error) {
-    console.error('Error sending welcome email:', error);
+    console.error('✗ Failed to send welcome email:', error.message);
     // Don't throw error for welcome email failures
+    return false;
   }
 };
