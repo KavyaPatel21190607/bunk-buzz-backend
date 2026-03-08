@@ -1,5 +1,6 @@
 import DailyAttendance from '../models/DailyAttendance.js';
 import Subject from '../models/Subject.js';
+import Timetable from '../models/Timetable.js';
 import { AppError } from '../middleware/errorHandler.js';
 
 /**
@@ -283,6 +284,25 @@ export const getAttendanceStats = async (req, res, next) => {
       isActive: true,
     });
 
+    // Fetch user's timetable to get realistic schedule
+    const timetable = await Timetable.find({
+      userId: req.user._id,
+      isActive: true,
+    }).populate('subjectId', 'name');
+
+    // Calculate lectures per week from timetable
+    const lecturesPerWeek = timetable.length;
+    const lecturesPerDay = lecturesPerWeek > 0 ? lecturesPerWeek / 5 : subjects.length; // Assume 5 working days
+
+    // Group timetable by subject to see frequency
+    const subjectFrequency = {};
+    timetable.forEach(entry => {
+      const subjectId = entry.subjectId?._id?.toString();
+      if (subjectId) {
+        subjectFrequency[subjectId] = (subjectFrequency[subjectId] || 0) + 1;
+      }
+    });
+
     let totalLectures = 0;
     let totalAttended = 0;
     let subjectsAboveMin = 0;
@@ -301,6 +321,12 @@ export const getAttendanceStats = async (req, res, next) => {
 
       totalSafeBunks += subject.safeBunks || 0;
 
+      const subjectId = subject._id.toString();
+      const weeklyFrequency = subjectFrequency[subjectId] || 1;
+      const weeksNeeded = subject.classesNeeded > 0 
+        ? Math.ceil(subject.classesNeeded / weeklyFrequency) 
+        : 0;
+
       return {
         id: subject._id,
         name: subject.name,
@@ -311,28 +337,48 @@ export const getAttendanceStats = async (req, res, next) => {
         minimumRequired: subject.minimumAttendance,
         safeBunks: subject.safeBunks,
         classesNeeded: subject.classesNeeded,
+        weeklyFrequency,
+        weeksNeeded,
         status: subject.attendancePercentage >= subject.minimumAttendance ? 'safe' : 'risk',
       };
     });
 
-    const overallAttendance = totalLectures > 0 
+    // Use user's manually set attendance if available (from college records)
+    const calculatedAttendance = totalLectures > 0 
       ? Number(((totalAttended / totalLectures) * 100).toFixed(2))
       : 0;
+    
+    const overallAttendance = user.currentOverallAttendance ?? calculatedAttendance;
 
     // Calculate overall attendance target (use user's preference or default 75%)
     const targetAttendance = user.overallMinimumAttendance || 75;
 
-    // Calculate classes needed to reach target attendance
+    // Calculate classes needed to reach target attendance BASED ON ACTUAL TIMETABLE
     let overallClassesNeeded = 0;
-    if (overallAttendance < targetAttendance) {
-      let attended = totalAttended;
-      let total = totalLectures;
+    let estimatedWeeks = 0;
+    let estimatedDays = 0;
 
-      while (((attended + overallClassesNeeded + 1) / (total + overallClassesNeeded + 1)) * 100 < targetAttendance) {
+    if (overallAttendance < targetAttendance) {
+      // If using college records, calculate based on that
+      let currentAttended = user.currentOverallAttendance 
+        ? Math.round((overallAttendance * totalLectures) / 100)
+        : totalAttended;
+      let currentTotal = totalLectures;
+
+      while (((currentAttended + overallClassesNeeded + 1) / (currentTotal + overallClassesNeeded + 1)) * 100 < targetAttendance) {
         overallClassesNeeded++;
         if (overallClassesNeeded > 1000) break; // Safety limit
       }
       overallClassesNeeded++; // Add one more for safety
+
+      // Calculate realistic timeline based on timetable
+      if (lecturesPerWeek > 0) {
+        estimatedWeeks = Math.ceil(overallClassesNeeded / lecturesPerWeek);
+        estimatedDays = estimatedWeeks * 5; // 5 working days per week
+      } else {
+        // Fallback if no timetable
+        estimatedDays = Math.ceil(overallClassesNeeded / (subjects.length || 1));
+      }
     }
 
     // Calculate overall safe bunks (how many lectures can be bunked while staying above target)
@@ -369,35 +415,37 @@ export const getAttendanceStats = async (req, res, next) => {
     const presentCount = recentRecords.filter(r => r.status === 'present').length;
     const absentCount = recentRecords.filter(r => r.status === 'absent').length;
 
-    // Calculate trend (comparing last 7 days to previous 7 days)
+    const currentWeekPercentage = recentRecords.length > 0
+      ? Number(((presentCount / recentRecords.length) * 100).toFixed(2))
+      : 0;
+
+    // Get previous week data for trend comparison
     const fourteenDaysAgo = new Date();
     fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
-    
+
     const previousWeekRecords = await DailyAttendance.find({
       userId: req.user._id,
       date: { $gte: fourteenDaysAgo, $lt: sevenDaysAgo },
     });
 
     const previousWeekPresent = previousWeekRecords.filter(r => r.status === 'present').length;
-    const previousWeekTotal = previousWeekRecords.length;
-    const currentWeekTotal = recentRecords.length;
-    
-    const previousWeekPercentage = previousWeekTotal > 0 
-      ? (previousWeekPresent / previousWeekTotal) * 100 
-      : 0;
-    const currentWeekPercentage = currentWeekTotal > 0 
-      ? (presentCount / currentWeekTotal) * 100 
+    const previousWeekPercentage = previousWeekRecords.length > 0
+      ? Number(((previousWeekPresent / previousWeekRecords.length) * 100).toFixed(2))
       : 0;
     
     const trend = currentWeekPercentage - previousWeekPercentage;
 
-    // Generate recommendations
+    // Generate timetable-aware recommendations
     const recommendations = [];
     
     if (overallAttendance < targetAttendance) {
+      const timelineMessage = lecturesPerWeek > 0
+        ? `Based on your timetable (${lecturesPerWeek} lectures/week), you need approximately ${estimatedWeeks} weeks (${estimatedDays} days) of perfect attendance.`
+        : `You need to attend ${overallClassesNeeded} consecutive classes.`;
+
       recommendations.push({
         type: 'warning',
-        message: `Your attendance is below target (${targetAttendance}%). You need to attend ${overallClassesNeeded} consecutive classes to reach ${targetAttendance}%.`,
+        message: `Your attendance is below target (${targetAttendance}%). You need to attend ${overallClassesNeeded} more classes to reach ${targetAttendance}%. ${timelineMessage}`,
         priority: 'high',
       });
       
@@ -408,11 +456,25 @@ export const getAttendanceStats = async (req, res, next) => {
         .slice(0, 3);
       
       if (criticalSubjects.length > 0) {
+        const criticalDetails = criticalSubjects.map(s => {
+          const freq = s.weeklyFrequency || 1;
+          return `${s.name} (${s.classesNeeded} classes needed, ${freq}x/week → ~${s.weeksNeeded} weeks)`;
+        }).join('; ');
+
         recommendations.push({
           type: 'action',
-          message: `Focus on improving: ${criticalSubjects.map(s => s.name).join(', ')}`,
+          message: `Priority subjects based on timetable: ${criticalDetails}`,
           priority: 'high',
           subjects: criticalSubjects.map(s => s.id),
+        });
+      }
+
+      // Timetable-specific advice
+      if (lecturesPerWeek > 0) {
+        recommendations.push({
+          type: 'action',
+          message: `Your timetable has ${lecturesPerWeek} lectures per week. Attending all of them consistently will help you reach your target faster.`,
+          priority: 'medium',
         });
       }
     } else {
@@ -456,9 +518,15 @@ export const getAttendanceStats = async (req, res, next) => {
           safeBunksAvailable: overallSafeBunks,
           projectedAfter5Classes,
           projectedAfter10Classes,
-          estimatedDaysToTarget: overallClassesNeeded > 0 
-            ? Math.ceil(overallClassesNeeded / (subjects.length || 1)) 
-            : 0,
+          estimatedDaysToTarget: estimatedDays,
+          estimatedWeeksToTarget: estimatedWeeks,
+          lecturesPerWeek,
+          lecturesPerDay: Number(lecturesPerDay.toFixed(1)),
+        },
+        timetableInfo: {
+          totalWeeklyLectures: lecturesPerWeek,
+          hasSchedule: timetable.length > 0,
+          subjectFrequency,
         },
         recentActivity: {
           last7Days: {
