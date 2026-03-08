@@ -272,11 +272,12 @@ export const deleteAttendance = async (req, res, next) => {
 
 /**
  * @route   GET /api/attendance/stats
- * @desc    Get overall attendance statistics
+ * @desc    Get comprehensive attendance analytics with predictions
  * @access  Private
  */
 export const getAttendanceStats = async (req, res, next) => {
   try {
+    const user = req.user;
     const subjects = await Subject.find({
       userId: req.user._id,
       isActive: true,
@@ -286,6 +287,7 @@ export const getAttendanceStats = async (req, res, next) => {
     let totalAttended = 0;
     let subjectsAboveMin = 0;
     let subjectsBelowMin = 0;
+    let totalSafeBunks = 0;
 
     const subjectStats = subjects.map((subject) => {
       totalLectures += subject.totalLectures;
@@ -297,17 +299,62 @@ export const getAttendanceStats = async (req, res, next) => {
         subjectsBelowMin++;
       }
 
+      totalSafeBunks += subject.safeBunks || 0;
+
       return {
         id: subject._id,
         name: subject.name,
+        code: subject.code,
         attendance: subject.attendancePercentage,
+        totalLectures: subject.totalLectures,
+        attendedLectures: subject.attendedLectures,
+        minimumRequired: subject.minimumAttendance,
         safeBunks: subject.safeBunks,
         classesNeeded: subject.classesNeeded,
+        status: subject.attendancePercentage >= subject.minimumAttendance ? 'safe' : 'risk',
       };
     });
 
     const overallAttendance = totalLectures > 0 
       ? Number(((totalAttended / totalLectures) * 100).toFixed(2))
+      : 0;
+
+    // Calculate overall attendance target (use user's preference or default 75%)
+    const targetAttendance = user.overallMinimumAttendance || 75;
+
+    // Calculate classes needed to reach target attendance
+    let overallClassesNeeded = 0;
+    if (overallAttendance < targetAttendance) {
+      let attended = totalAttended;
+      let total = totalLectures;
+
+      while (((attended + overallClassesNeeded + 1) / (total + overallClassesNeeded + 1)) * 100 < targetAttendance) {
+        overallClassesNeeded++;
+        if (overallClassesNeeded > 1000) break; // Safety limit
+      }
+      overallClassesNeeded++; // Add one more for safety
+    }
+
+    // Calculate overall safe bunks (how many lectures can be bunked while staying above target)
+    let overallSafeBunks = 0;
+    if (overallAttendance >= targetAttendance) {
+      let attended = totalAttended;
+      let total = totalLectures;
+
+      while (((attended) / (total + 1)) * 100 >= targetAttendance) {
+        overallSafeBunks++;
+        total++;
+        if (overallSafeBunks > 1000) break; // Safety limit
+      }
+    }
+
+    // Calculate projected attendance after attending next N classes
+    const projectedAfter5Classes = totalLectures > 0
+      ? Number((((totalAttended + 5) / (totalLectures + 5)) * 100).toFixed(2))
+      : 0;
+    
+    const projectedAfter10Classes = totalLectures > 0
+      ? Number((((totalAttended + 10) / (totalLectures + 10)) * 100).toFixed(2))
       : 0;
 
     // Get recent attendance (last 7 days)
@@ -317,30 +364,114 @@ export const getAttendanceStats = async (req, res, next) => {
     const recentRecords = await DailyAttendance.find({
       userId: req.user._id,
       date: { $gte: sevenDaysAgo },
-    });
+    }).populate('subjectId', 'name');
 
     const presentCount = recentRecords.filter(r => r.status === 'present').length;
     const absentCount = recentRecords.filter(r => r.status === 'absent').length;
+
+    // Calculate trend (comparing last 7 days to previous 7 days)
+    const fourteenDaysAgo = new Date();
+    fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+    
+    const previousWeekRecords = await DailyAttendance.find({
+      userId: req.user._id,
+      date: { $gte: fourteenDaysAgo, $lt: sevenDaysAgo },
+    });
+
+    const previousWeekPresent = previousWeekRecords.filter(r => r.status === 'present').length;
+    const previousWeekTotal = previousWeekRecords.length;
+    const currentWeekTotal = recentRecords.length;
+    
+    const previousWeekPercentage = previousWeekTotal > 0 
+      ? (previousWeekPresent / previousWeekTotal) * 100 
+      : 0;
+    const currentWeekPercentage = currentWeekTotal > 0 
+      ? (presentCount / currentWeekTotal) * 100 
+      : 0;
+    
+    const trend = currentWeekPercentage - previousWeekPercentage;
+
+    // Generate recommendations
+    const recommendations = [];
+    
+    if (overallAttendance < targetAttendance) {
+      recommendations.push({
+        type: 'warning',
+        message: `Your attendance is below target (${targetAttendance}%). You need to attend ${overallClassesNeeded} consecutive classes to reach ${targetAttendance}%.`,
+        priority: 'high',
+      });
+      
+      // Find subjects most affecting overall attendance
+      const criticalSubjects = subjectStats
+        .filter(s => s.status === 'risk')
+        .sort((a, b) => a.attendance - b.attendance)
+        .slice(0, 3);
+      
+      if (criticalSubjects.length > 0) {
+        recommendations.push({
+          type: 'action',
+          message: `Focus on improving: ${criticalSubjects.map(s => s.name).join(', ')}`,
+          priority: 'high',
+          subjects: criticalSubjects.map(s => s.id),
+        });
+      }
+    } else {
+      recommendations.push({
+        type: 'success',
+        message: `Great! Your attendance is above target. You can safely bunk ${overallSafeBunks} lectures while maintaining ${targetAttendance}%.`,
+        priority: 'low',
+      });
+    }
+
+    if (trend < -5) {
+      recommendations.push({
+        type: 'warning',
+        message: `Your attendance has dropped by ${Math.abs(trend).toFixed(1)}% this week. Try to attend more classes.`,
+        priority: 'medium',
+      });
+    } else if (trend > 5) {
+      recommendations.push({
+        type: 'success',
+        message: `Excellent! Your attendance improved by ${trend.toFixed(1)}% this week.`,
+        priority: 'low',
+      });
+    }
 
     res.status(200).json({
       success: true,
       data: {
         overall: {
+          currentAttendance: overallAttendance,
+          targetAttendance,
           totalLectures,
           totalAttended,
-          overallAttendance,
+          totalAbsent: totalLectures - totalAttended,
           subjectsAboveMin,
           subjectsBelowMin,
           totalSubjects: subjects.length,
+          status: overallAttendance >= targetAttendance ? 'safe' : 'risk',
+        },
+        predictions: {
+          classesNeededToReachTarget: overallClassesNeeded,
+          safeBunksAvailable: overallSafeBunks,
+          projectedAfter5Classes,
+          projectedAfter10Classes,
+          estimatedDaysToTarget: overallClassesNeeded > 0 
+            ? Math.ceil(overallClassesNeeded / (subjects.length || 1)) 
+            : 0,
         },
         recentActivity: {
           last7Days: {
             present: presentCount,
             absent: absentCount,
             total: recentRecords.length,
+            percentage: currentWeekPercentage.toFixed(2),
+            trend: trend.toFixed(2),
+            trendDirection: trend > 0 ? 'improving' : trend < 0 ? 'declining' : 'stable',
           },
         },
         subjects: subjectStats,
+        recommendations,
       },
     });
   } catch (error) {
